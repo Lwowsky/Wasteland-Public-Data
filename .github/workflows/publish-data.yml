@@ -1,0 +1,107 @@
+name: Publish Wasteland public JSON only
+
+on:
+  repository_dispatch:
+    types: [public_snapshot_changed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Data deploys are separate from the React site and never run npm or Vite.
+# Never cancel an active deployment: stale revisions are retried by the Worker.
+concurrency:
+  group: wasteland-public-json-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Download authorized public snapshot
+        env:
+          EXPORT_URL: ${{ vars.PUBLIC_SNAPSHOT_EXPORT_URL }}
+          EXPORT_TOKEN: ${{ secrets.PUBLIC_SNAPSHOT_EXPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPORT_URL" =~ ^https:// ]] || [[ -z "$EXPORT_TOKEN" ]]; then
+            echo 'Missing PUBLIC_SNAPSHOT_EXPORT_URL or PUBLIC_SNAPSHOT_EXPORT_TOKEN'
+            exit 1
+          fi
+          curl --fail-with-body --silent --show-error --retry 2 --max-time 30 \
+            -H "Authorization: Bearer $EXPORT_TOKEN" \
+            "${EXPORT_URL%/}/api/internal/public-snapshot" \
+            -o snapshot.json
+
+      - name: Create ONLY two public JSON files
+        run: |
+          set -euo pipefail
+          mkdir -p site/data
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          snapshot = json.loads(Path('snapshot.json').read_text(encoding='utf-8'))
+          revision = snapshot['revision']
+          if not isinstance(revision, int) or revision < 1:
+              raise ValueError('Missing positive snapshot revision')
+
+          summary = dict(snapshot['summary'])
+          recent = summary.pop('recentPlayers', [])
+          players = snapshot['players']
+          if not isinstance(players.get('players'), list) or not isinstance(recent, list):
+              raise ValueError('Invalid public snapshot format')
+          if len(players['players']) > 500 or int(players.get('total', 0)) > len(players['players']):
+              raise ValueError('More than 500 public players; export would be incomplete')
+
+          output = Path('site/data')
+          (output / 'summary.json').write_text(
+              json.dumps({'stats': summary, 'recentPlayers': recent}, ensure_ascii=False, separators=(',', ':')),
+              encoding='utf-8',
+          )
+          (output / 'players.json').write_text(
+              json.dumps(players, ensure_ascii=False, separators=(',', ':')),
+              encoding='utf-8',
+          )
+          (output / 'revision.json').write_text(
+              json.dumps({'revision': revision}), encoding='utf-8',
+          )
+          Path('site/index.html').write_text('<!doctype html><title>Wasteland public data</title>')
+          Path('site/.nojekyll').touch()
+          print(f'Prepared revision {revision}; {len(players["players"])} public players')
+          PY
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload tiny JSON-only artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Publish public JSON
+        id: deploy
+        uses: actions/deploy-pages@v4
+      - name: Acknowledge published revision to Cloudflare D1
+        env:
+          EXPORT_URL: ${{ vars.PUBLIC_SNAPSHOT_EXPORT_URL }}
+          EXPORT_TOKEN: ${{ secrets.PUBLIC_SNAPSHOT_EXPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          revision = json.loads(Path('site/data/revision.json').read_text())['revision']
+          Path('ack.json').write_text(json.dumps({'revision': revision}))
+          PY
+          curl --fail-with-body --silent --show-error --retry 3 --retry-delay 5 \
+            --max-time 30 \
+            -X POST \
+            -H "Authorization: Bearer $EXPORT_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data-binary @ack.json \
+            "${EXPORT_URL%/}/api/internal/public-snapshot/ack"
