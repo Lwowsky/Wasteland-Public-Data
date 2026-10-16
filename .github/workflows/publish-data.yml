@@ -39,7 +39,7 @@ jobs:
             "${EXPORT_URL%/}/api/internal/public-snapshot" \
             -o snapshot.json
 
-      - name: Create ONLY two public JSON files
+      - name: Create ONLY public JSON files
         run: |
           set -euo pipefail
           mkdir -p site/data
@@ -55,6 +55,19 @@ jobs:
           summary = dict(snapshot['summary'])
           recent = summary.pop('recentPlayers', [])
           players = snapshot['players']
+          site_settings = snapshot.get('siteSettings')
+          registration_settings = snapshot.get('registrationSettings')
+          if not (isinstance(site_settings, dict)
+                  and site_settings.get('success') is True
+                  and isinstance(site_settings.get('settings'), dict)
+                  and isinstance(site_settings['settings'].get('siteName'), str)):
+              raise ValueError('Missing PUBLIC site settings in Worker export')
+          if not (isinstance(registration_settings, dict)
+                  and registration_settings.get('success') is True
+                  and isinstance(registration_settings.get('settings'), dict)
+                  and isinstance(registration_settings.get('enabled'), bool)
+                  and isinstance(registration_settings.get('period'), dict)):
+              raise ValueError('Missing PUBLIC registration settings in Worker export')
           if not isinstance(players.get('players'), list) or not isinstance(recent, list):
               raise ValueError('Invalid public snapshot format')
           if len(players['players']) > 500 or int(players.get('total', 0)) > len(players['players']):
@@ -69,6 +82,14 @@ jobs:
               json.dumps(players, ensure_ascii=False, separators=(',', ':')),
               encoding='utf-8',
           )
+          for name, public_data in (
+              ('site-settings.json', site_settings),
+              ('registration-settings.json', registration_settings),
+          ):
+              (output / name).write_text(
+                  json.dumps(public_data, ensure_ascii=False, separators=(',', ':')),
+                  encoding='utf-8',
+              )
           (output / 'revision.json').write_text(
               json.dumps({'revision': revision}), encoding='utf-8',
           )
