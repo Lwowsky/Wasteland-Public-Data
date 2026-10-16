@@ -10,8 +10,6 @@ permissions:
   pages: write
   id-token: write
 
-# Data deploys are separate from the React site and never run npm or Vite.
-# Never cancel an active deployment: stale revisions are retried by the Worker.
 concurrency:
   group: wasteland-public-json-pages
   cancel-in-progress: false
@@ -36,8 +34,7 @@ jobs:
           fi
           curl --fail-with-body --silent --show-error --retry 2 --max-time 30 \
             -H "Authorization: Bearer $EXPORT_TOKEN" \
-            "${EXPORT_URL%/}/api/internal/public-snapshot" \
-            -o snapshot.json
+            "${EXPORT_URL%/}/api/internal/public-snapshot" -o snapshot.json
 
       - name: Create ONLY public JSON files
         run: |
@@ -46,17 +43,16 @@ jobs:
           python3 - <<'PY'
           import json
           from pathlib import Path
-
           snapshot = json.loads(Path('snapshot.json').read_text(encoding='utf-8'))
           revision = snapshot['revision']
           if not isinstance(revision, int) or revision < 1:
               raise ValueError('Missing positive snapshot revision')
-
           summary = dict(snapshot['summary'])
           recent = summary.pop('recentPlayers', [])
           players = snapshot['players']
           site_settings = snapshot.get('siteSettings')
           registration_settings = snapshot.get('registrationSettings')
+          final_plan = snapshot.get('finalPlan')
           if not (isinstance(site_settings, dict)
                   and site_settings.get('success') is True
                   and isinstance(site_settings.get('settings'), dict)
@@ -72,27 +68,25 @@ jobs:
               raise ValueError('Invalid public snapshot format')
           if len(players['players']) > 500 or int(players.get('total', 0)) > len(players['players']):
               raise ValueError('More than 500 public players; export would be incomplete')
-
+          if not (isinstance(final_plan, dict)
+                  and final_plan.get('success') is True
+                  and final_plan.get('accessMode') in ('public', 'code', 'link', 'private')):
+              raise ValueError('Missing final plan access mode')
+          if final_plan['accessMode'] != 'public' and final_plan.get('plan') is not None:
+              raise ValueError('Protected final plan must not be published')
           output = Path('site/data')
-          (output / 'summary.json').write_text(
-              json.dumps({'stats': summary, 'recentPlayers': recent}, ensure_ascii=False, separators=(',', ':')),
-              encoding='utf-8',
-          )
-          (output / 'players.json').write_text(
-              json.dumps(players, ensure_ascii=False, separators=(',', ':')),
-              encoding='utf-8',
-          )
           for name, public_data in (
+              ('summary.json', {'stats': summary, 'recentPlayers': recent}),
+              ('players.json', players),
               ('site-settings.json', site_settings),
               ('registration-settings.json', registration_settings),
+              ('final-plan.json', final_plan),
+              ('revision.json', {'revision': revision}),
           ):
               (output / name).write_text(
                   json.dumps(public_data, ensure_ascii=False, separators=(',', ':')),
                   encoding='utf-8',
               )
-          (output / 'revision.json').write_text(
-              json.dumps({'revision': revision}), encoding='utf-8',
-          )
           Path('site/index.html').write_text('<!doctype html><title>Wasteland public data</title>')
           Path('site/.nojekyll').touch()
           print(f'Prepared revision {revision}; {len(players["players"])} public players')
@@ -120,8 +114,7 @@ jobs:
           Path('ack.json').write_text(json.dumps({'revision': revision}))
           PY
           curl --fail-with-body --silent --show-error --retry 3 --retry-delay 5 \
-            --max-time 30 \
-            -X POST \
+            --max-time 30 -X POST \
             -H "Authorization: Bearer $EXPORT_TOKEN" \
             -H 'Content-Type: application/json' \
             --data-binary @ack.json \
