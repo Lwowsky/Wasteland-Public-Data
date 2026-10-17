@@ -22,6 +22,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+
     steps:
       - name: Download authorized public snapshot
         env:
@@ -29,85 +30,151 @@ jobs:
           EXPORT_TOKEN: ${{ secrets.PUBLIC_SNAPSHOT_EXPORT_TOKEN }}
         run: |
           set -euo pipefail
+
           if [[ ! "$EXPORT_URL" =~ ^https:// ]] || [[ -z "$EXPORT_TOKEN" ]]; then
             echo 'Missing PUBLIC_SNAPSHOT_EXPORT_URL or PUBLIC_SNAPSHOT_EXPORT_TOKEN'
             exit 1
           fi
-          curl --fail-with-body --silent --show-error --retry 2 --max-time 30 \
+
+          curl --fail-with-body --silent --show-error \
+            --retry 2 --max-time 30 \
             -H "Authorization: Bearer $EXPORT_TOKEN" \
-            "${EXPORT_URL%/}/api/internal/public-snapshot" -o snapshot.json
+            "${EXPORT_URL%/}/api/internal/public-snapshot" \
+            -o snapshot.json
 
       - name: Create ONLY public JSON files
         run: |
           set -euo pipefail
           mkdir -p site/data
+
           python3 - <<'PY'
           import json
           from pathlib import Path
-          snapshot = json.loads(Path('snapshot.json').read_text(encoding='utf-8'))
+
+          snapshot = json.loads(
+              Path('snapshot.json').read_text(encoding='utf-8')
+          )
+
           revision = snapshot['revision']
           if type(revision) is not int or revision < 1:
               raise ValueError('Missing positive snapshot revision')
+
           summary = dict(snapshot['summary'])
           recent = summary.pop('recentPlayers', [])
+
           players = snapshot['players']
           site_settings = snapshot.get('siteSettings')
           registration_settings = snapshot.get('registrationSettings')
           final_plan = snapshot.get('finalPlan')
-          if not (isinstance(site_settings, dict)
-                  and site_settings.get('success') is True
-                  and isinstance(site_settings.get('settings'), dict)
-                  and isinstance(site_settings['settings'].get('siteName'), str)):
-              raise ValueError('Missing PUBLIC site settings in Worker export')
-          if not (isinstance(registration_settings, dict)
-                  and registration_settings.get('success') is True
-                  and isinstance(registration_settings.get('settings'), dict)
-                  and isinstance(registration_settings.get('enabled'), bool)
-                  and isinstance(registration_settings.get('period'), dict)):
-              raise ValueError('Missing PUBLIC registration settings in Worker export')
-          if not isinstance(players.get('players'), list) or not isinstance(recent, list):
+
+          # Validate public site settings
+          if not (
+              isinstance(site_settings, dict)
+              and site_settings.get('success') is True
+              and isinstance(site_settings.get('settings'), dict)
+              and isinstance(
+                  site_settings['settings'].get('siteName'), str
+              )
+          ):
+              raise ValueError(
+                  'Missing PUBLIC site settings in Worker export'
+              )
+
+          # Validate public registration settings
+          if not (
+              isinstance(registration_settings, dict)
+              and registration_settings.get('success') is True
+              and isinstance(registration_settings.get('settings'), dict)
+              and isinstance(
+                  registration_settings.get('enabled'), bool
+              )
+              and isinstance(
+                  registration_settings.get('period'), dict
+              )
+          ):
+              raise ValueError(
+                  'Missing PUBLIC registration settings in Worker export'
+              )
+
+          # Validate players
+          if not isinstance(players, dict):
+              raise ValueError('Invalid players snapshot')
+
+          if not (
+              isinstance(players.get('players'), list)
+              and isinstance(recent, list)
+          ):
               raise ValueError('Invalid public snapshot format')
           if type(players.get('total')) is not int or players['total'] < 0:
               raise ValueError('Invalid player total')
-          # Do not reintroduce a hard 500-player ceiling. The export must
-          # include every visible-cycle player, whatever its total.
           if players['total'] > len(players['players']):
               raise ValueError('Incomplete public players export')
+
+          if players.get('accessMode') not in ('public', 'link', 'private', 'code'):
+              raise ValueError('Invalid player table access mode')
           if not (isinstance(final_plan, dict)
                   and final_plan.get('success') is True
-                  and final_plan.get('accessMode') in ('public', 'code', 'link', 'private')):
+                  and final_plan.get('accessMode') in ('public', 'link', 'private', 'code')):
               raise ValueError('Missing final plan access mode')
-          # Link-only JSON is intentionally public view data, protected by the
-          # client-side link gate, not by GitHub Pages authentication.
-          if final_plan['accessMode'] not in ('public', 'link') and final_plan.get('plan') is not None:
+
+          # Public static data for link mode is NOT authenticated at the host.
+          # Private/legacy code modes must not publish content.
+          if final_plan['accessMode'] in ('private', 'code') and final_plan.get('plan') is not None:
               raise ValueError('Protected final plan must not be published')
+          if players['accessMode'] in ('private', 'code') and players['players']:
+              raise ValueError('Protected players must not be published')
+
           output = Path('site/data')
-          for name, public_data in (
-              ('summary.json', {'stats': summary, 'recentPlayers': recent}),
+
+          public_files = (
+              (
+                  'summary.json',
+                  {
+                      'stats': summary,
+                      'recentPlayers': recent,
+                  },
+              ),
               ('players.json', players),
               ('site-settings.json', site_settings),
               ('registration-settings.json', registration_settings),
               ('final-plan.json', final_plan),
               ('revision.json', {'revision': revision}),
-          ):
+          )
+
+          for name, public_data in public_files:
               (output / name).write_text(
-                  json.dumps(public_data, ensure_ascii=False, separators=(',', ':')),
+                  json.dumps(
+                      public_data,
+                      ensure_ascii=False,
+                      separators=(',', ':'),
+                  ),
                   encoding='utf-8',
               )
-          Path('site/index.html').write_text('<!doctype html><title>Wasteland public data</title>')
+
+          Path('site/index.html').write_text(
+              '<!doctype html><title>Wasteland public data</title>',
+              encoding='utf-8',
+          )
+
           Path('site/.nojekyll').touch()
-          print(f'Prepared revision {revision}; {len(players["players"])} public players')
+
+          print(
+              f'Prepared revision {revision}; '
+              f'{len(players["players"])} public players; '
+              f'players mode={players["accessMode"]}; '
+              f'final plan mode={final_plan["accessMode"]}'
+          )
           PY
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
+
       - name: Upload tiny JSON-only artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
-      # If a newer D1 revision was created during this build, do NOT publish
-      # the stale artifact. A failed run is retried by the existing Worker cron.
+      # Reject a stale revision before deploying.
       - name: Reject stale snapshot before deploying
         env:
           EXPORT_URL: ${{ vars.PUBLIC_SNAPSHOT_EXPORT_URL }}
@@ -130,20 +197,33 @@ jobs:
       - name: Publish public JSON
         id: deploy
         uses: actions/deploy-pages@v4
+
       - name: Acknowledge published revision to Cloudflare D1
         env:
           EXPORT_URL: ${{ vars.PUBLIC_SNAPSHOT_EXPORT_URL }}
           EXPORT_TOKEN: ${{ secrets.PUBLIC_SNAPSHOT_EXPORT_TOKEN }}
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import json
           from pathlib import Path
-          revision = json.loads(Path('site/data/revision.json').read_text())['revision']
-          Path('ack.json').write_text(json.dumps({'revision': revision}))
+
+          revision = json.loads(
+              Path('site/data/revision.json').read_text(
+                  encoding='utf-8'
+              )
+          )['revision']
+
+          Path('ack.json').write_text(
+              json.dumps({'revision': revision}),
+              encoding='utf-8',
+          )
           PY
-          curl --fail-with-body --silent --show-error --retry 3 --retry-delay 5 \
-            --max-time 30 -X POST \
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 --retry-delay 5 --max-time 30 \
+            -X POST \
             -H "Authorization: Bearer $EXPORT_TOKEN" \
             -H 'Content-Type: application/json' \
             --data-binary @ack.json \
