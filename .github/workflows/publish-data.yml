@@ -10,6 +10,7 @@ permissions:
   pages: write
   id-token: write
 
+# Serialize Pages deployments: older builds cannot overtake newer builds.
 concurrency:
   group: wasteland-public-json-pages
   cancel-in-progress: false
@@ -45,7 +46,7 @@ jobs:
           from pathlib import Path
           snapshot = json.loads(Path('snapshot.json').read_text(encoding='utf-8'))
           revision = snapshot['revision']
-          if not isinstance(revision, int) or revision < 1:
+          if type(revision) is not int or revision < 1:
               raise ValueError('Missing positive snapshot revision')
           summary = dict(snapshot['summary'])
           recent = summary.pop('recentPlayers', [])
@@ -66,13 +67,19 @@ jobs:
               raise ValueError('Missing PUBLIC registration settings in Worker export')
           if not isinstance(players.get('players'), list) or not isinstance(recent, list):
               raise ValueError('Invalid public snapshot format')
-          if len(players['players']) > 500 or int(players.get('total', 0)) > len(players['players']):
-              raise ValueError('More than 500 public players; export would be incomplete')
+          if type(players.get('total')) is not int or players['total'] < 0:
+              raise ValueError('Invalid player total')
+          # Do not reintroduce a hard 500-player ceiling. The export must
+          # include every visible-cycle player, whatever its total.
+          if players['total'] > len(players['players']):
+              raise ValueError('Incomplete public players export')
           if not (isinstance(final_plan, dict)
                   and final_plan.get('success') is True
                   and final_plan.get('accessMode') in ('public', 'code', 'link', 'private')):
               raise ValueError('Missing final plan access mode')
-          if final_plan['accessMode'] != 'public' and final_plan.get('plan') is not None:
+          # Link-only JSON is intentionally public view data, protected by the
+          # client-side link gate, not by GitHub Pages authentication.
+          if final_plan['accessMode'] not in ('public', 'link') and final_plan.get('plan') is not None:
               raise ValueError('Protected final plan must not be published')
           output = Path('site/data')
           for name, public_data in (
@@ -98,6 +105,28 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
+
+      # If a newer D1 revision was created during this build, do NOT publish
+      # the stale artifact. A failed run is retried by the existing Worker cron.
+      - name: Reject stale snapshot before deploying
+        env:
+          EXPORT_URL: ${{ vars.PUBLIC_SNAPSHOT_EXPORT_URL }}
+          EXPORT_TOKEN: ${{ secrets.PUBLIC_SNAPSHOT_EXPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error --retry 2 --max-time 30 \
+            -H "Authorization: Bearer $EXPORT_TOKEN" \
+            "${EXPORT_URL%/}/api/internal/public-snapshot" -o latest-snapshot.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          prepared = json.loads(Path('site/data/revision.json').read_text())['revision']
+          latest = json.loads(Path('latest-snapshot.json').read_text())['revision']
+          if type(latest) is not int or latest != prepared:
+              raise SystemExit(f'STALE_SNAPSHOT: prepared={prepared}, current={latest}. Cron will retry.')
+          print(f'Revision {prepared} is current; deploying')
+          PY
+
       - name: Publish public JSON
         id: deploy
         uses: actions/deploy-pages@v4
